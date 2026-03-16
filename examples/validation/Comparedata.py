@@ -3,7 +3,7 @@ from pathlib import Path
 from kite_fem.saveload import load_fem_structure
 from kitesim.utils import load_yaml
 from kitesim import read_struc_geometry_yaml_level_2
-from kite_fem.Functions import adapt_stiffnesses
+from kite_fem.Functions import adapt_stiffnesses,check_element_strain
 import csv
 
 PROJECT_DIR = Path(__file__).resolve().parents[2]
@@ -85,7 +85,9 @@ for load_case in range(1,11):
     tolerance = kite.crisfield_history[-1]
     output.append(tolerance)
     output.insert(0, load_case)
-    max_strain = adapt_stiffnesses(kite, False)  
+    strain_data = check_element_strain(kite, False)
+    all_strains = strain_data['spring_strains'] + strain_data['beam_strains']
+    max_strain = max(all_strains)
     output.append(max_strain)
     csv_path = Path(__file__).parent / "model_results.csv"
     with open(csv_path, 'w' if load_case == 1 else 'a', newline='') as f:
