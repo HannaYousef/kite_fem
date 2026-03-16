@@ -21,6 +21,8 @@ from kite_fem.saveload import save_fem_structure
 
 import matplotlib.pyplot as plt
 import numpy as np
+import time
+import csv
 
 PROJECT_DIR = Path(__file__).resolve().parents[2]
 kite_name = "TUDELFT_V3_KITE"  
@@ -108,16 +110,23 @@ def solve_single_case(args):
     iteration = 1
     print("set up kite for case",load_case)
     while max_strain >1 and iteration <5:
+        start_time = time.time()
         print("load case",load_case, "iteration",iteration)
         kite.solve(fe=fe, max_iterations=15000, tolerance=0.01, step_limit=.005, 
                 relax_init=.25, relax_min=0.00, relax_update=0.9998, k_update=1, I_stiffness=15)
+        end_time = time.time()
         max_strain = adapt_stiffnesses(kite)
         iteration += 1
+    elapsed_time = end_time - start_time
     # Save results for this case
     result_dir = Path(__file__).resolve().parent / "results"
     result_dir.mkdir(exist_ok=True)
     save_path = result_dir / f"load_case_{load_case}.npz"
     save_fem_structure(kite,save_path)
+    csv_path = result_dir / "timing.csv"
+    with open(csv_path, "a", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([load_case, elapsed_time])
 
 def get_load_cases():
     pressures = [0.15, 0.25]
