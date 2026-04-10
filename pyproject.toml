@@ -47,3 +47,16 @@ dev = ["pytest", "black", "flake8", "pytest-cov"]
 
 [project.urls]
 Repository = "https://github.com/awegroup/kite_fem.git"
+
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["win-64"]
+
+[tool.pixi.pypi-dependencies]
+kite_fem = { path = ".", editable = true }
+
+[tool.pixi.environments]
+default = { solve-group = "default" }
+dev = { features = ["dev"], solve-group = "default" }
+
+[tool.pixi.tasks]
