@@ -61,6 +61,12 @@ class BeamElement:
         GJ = T*1/(rotation)
         self.G = GJ/self.J
         self.prop.G = self.G
+        if self.G < 0:
+            print(
+                "Invalid beam shear modulus detected: "
+                f"G={self.G:.6e} Pa (d={2*self.r:.6f} m, p={self.p:.6f} bar, L={self.L:.6f} m)"
+            )
+            raise ValueError("Beam shear modulus G must be non-negative.")
 
         ##Determine EI from deflection
         deflection = self.get_beam_deflection()
@@ -85,6 +91,12 @@ class BeamElement:
         EI = P*1**3/(3*(deflection-(P*1/((8/9)*self.A*self.G))))
         self.E = EI/self.I
         self.prop.E = self.E
+        if self.E < 0:
+            print(
+                "Invalid beam Young's modulus detected: "
+                f"E={self.E:.6e} Pa (d={2*self.r:.6f} m, p={self.p:.6f} bar, L={self.L:.6f} m)"
+            )
+            raise ValueError("Beam Young's modulus E must be non-negative.")
 
 
     def get_beam_deflection(self):
