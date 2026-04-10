@@ -180,3 +180,6 @@ processed_data/*
 results/*
 # also ignore animation files, they are too big
 results/TUDELFT_V3_KITE/**/**/animation/
+# pixi environments
+.pixi/*
+!.pixi/config.toml
