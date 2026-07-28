@@ -41,6 +41,10 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 addopts = "--cov=kite_fem"
+pythonpath = ["src"]
+testpaths = ["tests"]
+norecursedirs = ["venv", "pytest-cache-files-*", "docs/.tmp"]
+cache_dir = "docs/.tmp/pytest_cache"
 
 [project.optional-dependencies]
 dev = ["pytest", "black", "flake8", "pytest-cov"]
