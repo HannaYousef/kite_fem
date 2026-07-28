@@ -1,39 +1,79 @@
 from kite_fem.FEMStructure import FEM_structure
 import numpy as np
 from pyfe3d import DOF
+from scipy.spatial.transform import Rotation
 
 
 
-def relaxbridles(kite: FEM_structure,canopy_nodes,origin):
+def _rebuild_structure_with_positions(kite, positions, velocities=None):
+    positions = np.asarray(positions, dtype=float)
+    if positions.shape != (kite.num_nodes, 3):
+        raise ValueError(
+            f"positions must have shape ({kite.num_nodes}, 3), got {positions.shape}."
+        )
+
+    if velocities is None:
+        velocities = [condition[1] for condition in kite.initial_conditions]
+    velocities = np.asarray(velocities, dtype=float)
+    if velocities.shape != (kite.num_nodes, 3):
+        raise ValueError(
+            f"velocities must have shape ({kite.num_nodes}, 3), got {velocities.shape}."
+        )
+
+    initial_conditions = []
+    for node_id, (_, _, mass, fixed) in enumerate(kite.initial_conditions):
+        initial_conditions.append(
+            [positions[node_id].copy(), velocities[node_id].copy(), mass, fixed]
+        )
+
+    rebuilt = FEM_structure(
+        initial_conditions,
+        kite.spring_matrix,
+        kite.pulley_matrix,
+        kite.beam_matrix,
+    )
+
+    for source, target in zip(kite.spring_elements, rebuilt.spring_elements):
+        target.k = source.k
+        target.l0 = source.l0
+        target.spring.kxe = source.k
+        target.tension_smoothing = source.tension_smoothing
+
+    beam_attributes = ("r", "A", "I", "J", "k", "p", "L", "E", "G", "collapsed")
+    beam_prop_attributes = ("A", "Ay", "Az", "Iyy", "Izz", "J", "E", "G")
+    for source, target in zip(kite.beam_elements, rebuilt.beam_elements):
+        for attribute in beam_attributes:
+            setattr(target, attribute, getattr(source, attribute))
+        for attribute in beam_prop_attributes:
+            setattr(target.prop, attribute, getattr(source.prop, attribute))
+        target.beam.length = source.beam.length
+
+    return rebuilt
+
+
+def relaxbridles(
+    kite: FEM_structure,
+    canopy_nodes,
+    origin,
+    pull_down_force_z=-100.0,
+    settle_force_z=-1.0,
+):
     kite = fix_nodes(kite,canopy_nodes)
-    initial_conditions= kite.initial_conditions
-    pulley_matrix = kite.pulley_matrix
-    spring_matrix= kite.spring_matrix
-    beam_matrix = kite.beam_matrix
     fe = np.zeros(kite.N)
 
     for id in origin:
         kite.bc[6 * id+2] = True
         kite.fixed[6 * id+2] = False
-        fe[6*id+2] = -100
+        fe[6*id+2] = pull_down_force_z
     
     kite.solve(fe,max_iterations=300,tolerance=0.01,print_info=False)
     for id in origin:
-        fe[6*id+2] = -1
+        fe[6*id+2] = settle_force_z
     kite.solve(fe,max_iterations=300,tolerance=0.01,print_info=False)
 
-    initcoords = np.reshape(kite.coords_init, (-1, 3))
     newcoords = np.reshape(kite.coords_current, (-1, 3))
-    
-    z_offset = newcoords[origin[0]][2] - initcoords[origin[0]][2]
-
-    initial_conditions_new = []
-    for id, (pos,vel,mass,fixed) in enumerate(initial_conditions):
-        posnew = newcoords[id]
-        posnew[2] += z_offset
-        initial_conditions_new.append([posnew,vel,mass,fixed])
-    kite = FEM_structure(initial_conditions_new,spring_matrix,pulley_matrix,beam_matrix)
-    return kite
+    newcoords = newcoords - newcoords[origin[0]]
+    return _rebuild_structure_with_positions(kite, newcoords)
 
 def fix_nodes(kite: FEM_structure,indices):
     for id in indices:
@@ -45,6 +85,84 @@ def set_pressure(kite: FEM_structure,pressure):
     for beam in kite.beam_elements:
         beam.p = pressure
     return kite
+
+def load_resultant_and_moment(structure: FEM_structure, fe, reference_node=0):
+    fe = np.asarray(fe, dtype=float)
+    if fe.shape != (structure.N,):
+        raise ValueError(
+            f"External force vector must have shape ({structure.N},), got {fe.shape}."
+        )
+
+    coords = structure.coords_current.reshape(structure.num_nodes, 3)
+    nodal_loads = fe.reshape(structure.num_nodes, DOF)
+    forces = nodal_loads[:, :3]
+    nodal_moments = nodal_loads[:, 3:]
+    reference = coords[reference_node]
+    resultant = forces.sum(axis=0)
+    moment = (
+        np.cross(coords - reference, forces).sum(axis=0)
+        + nodal_moments.sum(axis=0)
+    )
+    return resultant, moment
+
+
+def trim_structure_for_dead_load(structure: FEM_structure, fe, reference_node=0):
+    """Rotate an undeformed structure to its stable rigid-body dead-load trim.
+
+    The force vectors stay fixed in the global frame. The returned structure is
+    rebuilt at the orientation that minimizes the dead-load potential, so the
+    force-position moment about ``reference_node`` is zero before flexible
+    deformation. Element lengths, rest lengths, masses, and material properties
+    are preserved.
+
+    This operation is not valid for aerodynamic or other follower loads whose
+    vectors must be recomputed when the structure rotates.
+    """
+    fe = np.asarray(fe, dtype=float)
+    if fe.shape != (structure.N,):
+        raise ValueError(
+            f"External force vector must have shape ({structure.N},), got {fe.shape}."
+        )
+    if not 0 <= reference_node < structure.num_nodes:
+        raise ValueError("reference_node is outside the structure node range.")
+    if not np.allclose(
+        structure.coords_rotations_current,
+        structure.coords_rotations_init,
+        rtol=0.0,
+        atol=1e-12,
+    ):
+        raise ValueError("Dead-load trim requires an undeformed structure.")
+
+    nodal_loads = fe.reshape(structure.num_nodes, DOF)
+    forces = nodal_loads[:, :3]
+    if not np.allclose(nodal_loads[:, 3:], 0.0, rtol=0.0, atol=1e-12):
+        raise ValueError("Dead-load trim does not support explicit nodal moments.")
+
+    coords = structure.coords_init.reshape(structure.num_nodes, 3)
+    reference = coords[reference_node]
+    relative_coords = coords - reference
+    active = (np.linalg.norm(forces, axis=1) > 0.0) & (
+        np.linalg.norm(relative_coords, axis=1) > 0.0
+    )
+    if not np.any(active):
+        raise ValueError("Dead-load trim requires a force away from the reference node.")
+
+    rotation, _ = Rotation.align_vectors(
+        forces[active],
+        relative_coords[active],
+    )
+    positions_rotated = rotation.apply(relative_coords) + reference
+    velocities = np.asarray(
+        [condition[1] for condition in structure.initial_conditions],
+        dtype=float,
+    )
+    velocities_rotated = rotation.apply(velocities)
+    trimmed = _rebuild_structure_with_positions(
+        structure,
+        positions_rotated,
+        velocities_rotated,
+    )
+    return trimmed, rotation
 
 def check_element_strain(structure, print_results=False):
     """
@@ -210,9 +328,18 @@ def check_element_strain(structure, print_results=False):
     
     return strain_data
 
-def adapt_stiffnesses(structure:FEM_structure,max_stiffness = 50000):
-    #adapts stiffnesses of a converged kite structure such that springs with extensions >1% are stiffened
-    max_strain = 0
+def adapt_stiffnesses(structure: FEM_structure, max_stiffness=50000):
+    """Increase overstrained element stiffness without ever weakening an element."""
+    if not np.isscalar(max_stiffness):
+        raise ValueError("max_stiffness must be a finite positive scalar.")
+    try:
+        max_stiffness = float(max_stiffness)
+    except (TypeError, ValueError) as error:
+        raise ValueError("max_stiffness must be a finite positive scalar.") from error
+    if not np.isfinite(max_stiffness) or max_stiffness <= 0:
+        raise ValueError("max_stiffness must be a finite positive scalar.")
+
+    max_strain = 0.0
     coords = structure.coords_current
     for spring_element in structure.spring_elements:
         if spring_element.springtype == "pulley":
@@ -224,27 +351,41 @@ def adapt_stiffnesses(structure:FEM_structure,max_stiffness = 50000):
         else:
             length = spring_element.unit_vector(coords)[1]
             l0 = spring_element.l0
-        strain = (length-l0)/l0*100
-        if strain > 1:
-            spring_element.k *= 2
-        elif strain > 2:
-            spring_element.k *= strain
-        spring_element.k = min(spring_element.k,max_stiffness)
-        max_strain = max(max_strain,strain)
+        strain = (length - l0) / l0 * 100
+        if strain > 2:
+            stiffness_factor = strain
+        elif strain > 1:
+            stiffness_factor = 2.0
+        else:
+            stiffness_factor = 1.0
+        spring_element.k = min(
+            spring_element.k * stiffness_factor,
+            max_stiffness,
+        )
+        spring_element.spring.kxe = spring_element.k
+        max_strain = max(max_strain, strain)
 
     for beam_element in structure.beam_elements:
         length = beam_element.unit_vector(coords)[1]
         l0 = beam_element.L
-        strain = abs((length-l0)/l0*100)
+        strain = abs((length - l0) / l0 * 100)
         E = beam_element.E
-        A = beam_element.A 
-        if strain > 1:
-            beam_element.A *= 2
-        elif strain > 2:
-            beam_element.A *= strain
-        max_A = max_stiffness*l0/E
-        beam_element.A = min(beam_element.A,max_A)
-        max_strain = max(max_strain,strain)
+        if strain > 2:
+            stiffness_factor = strain
+        elif strain > 1:
+            stiffness_factor = 2.0
+        else:
+            stiffness_factor = 1.0
+
+        current_axial_stiffness = E * beam_element.A / l0
+        target_axial_stiffness = min(
+            current_axial_stiffness * stiffness_factor,
+            max_stiffness,
+        )
+        if target_axial_stiffness > current_axial_stiffness:
+            beam_element.A = target_axial_stiffness * l0 / E
+            beam_element.prop.A = beam_element.A
+        max_strain = max(max_strain, strain)
     return max_strain
     
 def extract_cross_sections(kite,canopy_sections):
@@ -314,6 +455,4 @@ def set_new_origin(kite,node):
     origin = coords[node]
     coords -= origin
     kite.coords_current = coords.flatten()
-
-    
     
