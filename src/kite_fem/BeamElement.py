@@ -1,6 +1,7 @@
 import numpy as np
 from pyfe3d.beamprop import BeamProp
 from pyfe3d import BeamC, BeamCProbe, DOF
+from scipy.spatial.transform import Rotation
 
 class BeamElement:
     def __init__(self, n1 : int, n2 : int, init_k_KC0 : int):
@@ -14,6 +15,7 @@ class BeamElement:
         self.beam.c1 = DOF * n1
         self.beam.c2 = DOF * n2
         self.update_KC0v_only = 0
+        self.reference_rotation_matrix = None
 
     def set_inflatable_beam_properties(self,d,p,L):
         #Set properties
@@ -136,18 +138,62 @@ class BeamElement:
         xj = coords[self.beam.c2//2 + 1] - coords[self.beam.c1//2 + 1]
         xk = coords[self.beam.c2//2 + 2] - coords[self.beam.c1//2 + 2]
         l = (xi**2 + xj**2 + xk**2)**0.5
+        if np.isclose(l, 0.0):
+            raise ValueError(
+                "Zero-length beam element detected; the element direction is undefined."
+            )
         unit_vect = np.array([xi, xj, xk])/l
         return unit_vect,l
     
-    def update_rotation_matrix(self, coords : np.ndarray):
-        #determine arbitrary vector on plane xy to describe coordinate system along with vector x
+    def _rotation_matrix(self):
+        return np.array(
+            [
+                [self.beam.r11, self.beam.r12, self.beam.r13],
+                [self.beam.r21, self.beam.r22, self.beam.r23],
+                [self.beam.r31, self.beam.r32, self.beam.r33],
+            ]
+        )
+
+    @staticmethod
+    def _shortest_arc_rotation(vector_from, vector_to, fallback_axis):
+        cross = np.cross(vector_from, vector_to)
+        sine = np.linalg.norm(cross)
+        cosine = np.clip(np.dot(vector_from, vector_to), -1.0, 1.0)
+        if sine > 1e-12:
+            axis = cross / sine
+            return Rotation.from_rotvec(np.arctan2(sine, cosine) * axis).as_matrix()
+        if cosine > 0.0:
+            return np.eye(3)
+        return Rotation.from_rotvec(np.pi * fallback_axis).as_matrix()
+
+    def set_reference_geometry(self, coords: np.ndarray):
         unit_vect = self.unit_vector(coords)[0]
-        xi, xj ,xk = unit_vect[0], unit_vect[1], unit_vect[2]
-        vxyi, vxyj, vxyk =  unit_vect[1], unit_vect[2], unit_vect[0]
-        if xi == xj  and xj == xk:
-            vxyi *= -1
-        #update element rotation matrix in pyfe3d
-        self.beam.update_rotation_matrix(vxyi, vxyj, vxyk, coords)
+        vxy = np.array([unit_vect[1], unit_vect[2], unit_vect[0]])
+        if np.allclose(vxy, 0.0) or np.isclose(
+            abs(np.dot(vxy / np.linalg.norm(vxy), unit_vect)),
+            1.0,
+        ):
+            vxy = np.array([0.0, 1.0, 0.0])
+            if np.isclose(abs(np.dot(vxy, unit_vect)), 1.0):
+                vxy = np.array([0.0, 0.0, 1.0])
+        self.beam.update_rotation_matrix(*vxy, coords)
+        self.reference_rotation_matrix = self._rotation_matrix()
+
+    def update_rotation_matrix(self, coords : np.ndarray):
+        if self.reference_rotation_matrix is None:
+            self.set_reference_geometry(coords)
+            return
+
+        current_axis = self.unit_vector(coords)[0]
+        reference_axis = self.reference_rotation_matrix[:, 0]
+        reference_y = self.reference_rotation_matrix[:, 1]
+        transport = self._shortest_arc_rotation(
+            reference_axis,
+            current_axis,
+            reference_y,
+        )
+        transported_y = transport @ reference_y
+        self.beam.update_rotation_matrix(*transported_y, coords)
     
     def update_KC0(self, KC0r : np.ndarray, KC0c : np.ndarray, KC0v : np.ndarray, coords : np.ndarray):
         #update element rotation matrix and adds contribution to global stiffness matrix
@@ -158,10 +204,32 @@ class BeamElement:
         return KC0r, KC0c, KC0v
     
     def beam_internal_forces(self, displacement: np.ndarray, coords: np.ndarray,fi: np.ndarray):
-        #Update rotation matrix
+        # Update the corotational frame and remove rigid-body motion before
+        # evaluating the linear pyfe3d constitutive law.
         self.update_rotation_matrix(coords)
-        #Updating displacement vector
-        self.beam.update_probe_ue(displacement)
+        current_rotation_matrix = self._rotation_matrix()
+        rigid_rotation_matrix = (
+            current_rotation_matrix @ self.reference_rotation_matrix.T
+        )
+        rigid_rotation = Rotation.from_matrix(rigid_rotation_matrix)
+
+        corotational_displacement = np.zeros_like(displacement)
+        _, current_length = self.unit_vector(coords)
+        axial_displacement = current_length - self.L
+        axial_vector = current_rotation_matrix[:, 0] * axial_displacement / 2.0
+        corotational_displacement[self.beam.c1 : self.beam.c1 + 3] = -axial_vector
+        corotational_displacement[self.beam.c2 : self.beam.c2 + 3] = axial_vector
+
+        for dof_start in (self.beam.c1, self.beam.c2):
+            nodal_rotation = Rotation.from_rotvec(
+                displacement[dof_start + 3 : dof_start + 6]
+            )
+            relative_rotation = nodal_rotation * rigid_rotation.inv()
+            corotational_displacement[dof_start + 3 : dof_start + 6] = (
+                relative_rotation.as_rotvec()
+            )
+
+        self.beam.update_probe_ue(corotational_displacement)
         #Update properties EI and GJ to match the displacement using experimental relations
         self.update_inflatable_beam_properties()
         #Calculate internal forces
