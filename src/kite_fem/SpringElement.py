@@ -1,6 +1,8 @@
 import numpy as np
 from pyfe3d import Spring, SpringProbe, DOF
 
+ACTIVE_LENGTH_RTOL = 1e-9
+
 class SpringElement:
     def __init__(self, n1 : int, n2 : int, init_k_KC0 : int):
         #initialising pyfe3d spring element
@@ -12,6 +14,9 @@ class SpringElement:
         self.spring.c1 = DOF * n1
         self.spring.c2 = DOF * n2
         self.update_KC0v_only = 0
+        self.tension_smoothing = 0.0
+        self.current_extension = 0.0
+        self.current_tangent_stiffness = 0.0
 
     def set_spring_properties(self, l0 : float, k : float, springtype : str, i_other_pulley: int = 0):
         #setting spring properties
@@ -34,6 +39,10 @@ class SpringElement:
         xj = coords[self.spring.c2//2 + 1] - coords[self.spring.c1//2 + 1]
         xk = coords[self.spring.c2//2 + 2] - coords[self.spring.c1//2 + 2]
         l = np.linalg.norm([xi,xj,xk])
+        if np.isclose(l, 0.0):
+            raise ValueError(
+                "Zero-length spring element detected; the element direction is undefined."
+            )
         unit_vect = np.array([xi, xj, xk])/l
         return unit_vect,l
     
@@ -55,19 +64,34 @@ class SpringElement:
         self.update_KC0v_only = 1
         return KC0r, KC0c, KC0v
 
+    def update_current_stiffness_state(self, coords: np.ndarray, l_other_pulley: float = 0.0):
+        #Set spring stiffness according to the current element state.
+        unit_vector, l = self.unit_vector(coords)
+        total_length = l + l_other_pulley
+        raw_extension = total_length - self.l0
+        active = True
+        self.current_extension = raw_extension
+        self.current_tangent_stiffness = self.k
+
+        if self.springtype in ("noncompressive", "pulley") and self.tension_smoothing > 0.0:
+            root = np.sqrt(raw_extension**2 + self.tension_smoothing**2)
+            self.current_extension = 0.5 * (raw_extension + root)
+            self.current_tangent_stiffness = self.k * 0.5 * (1.0 + raw_extension / root)
+            active = self.current_tangent_stiffness > 0.0
+        elif self.springtype in ("noncompressive", "pulley"):
+            tolerance = ACTIVE_LENGTH_RTOL * max(1.0, abs(self.l0))
+            active = total_length >= self.l0 - tolerance
+            self.current_extension = max(raw_extension, 0.0)
+            self.current_tangent_stiffness = self.k if active else 0.0
+
+        self.spring.kxe = self.current_tangent_stiffness if active else 0.0
+        return unit_vector, l, active
+
     def spring_internal_forces(self, coords: np.ndarray, l_other_pulley:float = 0.0):
         #Set spring stiffness
-        k_fi = self.k
-        self.spring.kxe = self.k
-        #Set noncompressive and pulley spring stiffness to zero if compressed
-        unit_vector,l = self.unit_vector(coords)
-        if self.springtype == "noncompressive" or self.springtype == "pulley":
-            if l+l_other_pulley < (self.l0):
-                self.spring.kxe = 0*self.k
-                k_fi = 0*self.k
-
+        unit_vector, l, active = self.update_current_stiffness_state(coords, l_other_pulley)
         # calculate spring force and allign with unit vector
-        f_s = k_fi * (l + l_other_pulley - self.l0)
+        f_s = self.k * self.current_extension if active else 0.0
         fi = f_s * unit_vector
 
         #append with zeros for rotational DOF's

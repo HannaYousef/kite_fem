@@ -2,13 +2,6 @@ from pathlib import Path
 from multiprocessing import Pool, cpu_count
 import copy
 
-from kitesim import (
-    structural_kite_fem_level_2,
-    read_struc_geometry_yaml_level_2,
-)
-from kitesim.utils import (
-    load_yaml,
-)
 from kite_fem.FEMStructure import FEM_structure
 from kite_fem.Plotting import (
     plot_structure,
@@ -17,7 +10,7 @@ from kite_fem.Plotting import (
 )
 
 from kite_fem.Functions import relaxbridles, fix_nodes,set_pressure, adapt_stiffnesses, check_element_strain
-from kite_fem.saveload import save_fem_structure
+from kite_fem.saveload import load_fem_structure,save_fem_structure
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -25,68 +18,16 @@ import time
 import csv
 
 PROJECT_DIR = Path(__file__).resolve().parents[2]
-kite_name = "TUDELFT_V3_KITE"  
-struc_geometry_path = (
+kite_path = (
     Path(PROJECT_DIR)
     / "data"
-    / f"{kite_name}"
-    / "struc_geometry_hanging_test.yaml"
+    / "TUDELFT_V3_KITE"
 )
-struc_geometry = load_yaml(struc_geometry_path)
-
-(
-    # node level
-    struc_nodes,
-    m_arr,
-    struc_node_le_indices,
-    struc_node_te_indices,
-    power_tape_index,
-    steering_tape_indices,
-    pulley_node_indices,
-    canopy_sections,
-    strut_sections,
-    simplified_bridle_points,
-    # element level
-    kite_connectivity_arr,
-    bridle_connectivity_arr,
-    bridle_diameter_arr,
-    l0_arr,
-    k_arr,
-    c_arr,
-    linktype_arr,
-    pulley_line_indices,
-    pulley_line_to_other_node_pair_dict,
-) = read_struc_geometry_yaml_level_2.main(struc_geometry)
-
-config = {"is_with_initial_point_velocity": False}
+m_arr = np.loadtxt(kite_path / "mass_hanging_test.csv", delimiter=',')
 
 def create_kite():
     """Factory function to create a fresh kite instance"""
-    kite = structural_kite_fem_level_2.instantiate(
-        config,
-        struc_geometry,
-        struc_nodes,
-        kite_connectivity_arr,
-        l0_arr,
-        k_arr,
-        c_arr,
-        m_arr,
-        linktype_arr,
-        pulley_line_to_other_node_pair_dict,
-        canopy_sections,
-        strut_sections,
-    )[0]
-    
-    canopy_nodes = list(set([node for section in canopy_sections + strut_sections for node in section]))
-    kite = fix_nodes(kite,[0,129,128,127,72,81,82,115,116,106])
-    kite = fix_nodes(kite,[0,129,128,127,72,81,82,115,116,106])
-    origin =  [82,116]
-    kite = relaxbridles(kite,canopy_nodes,origin)
-    kite = fix_nodes(kite,[0,129,128,127,72,81,82,115,116,106])
-    result_dir = Path(__file__).resolve().parent / "results"
-    result_dir.mkdir(exist_ok=True)
-    save_path = result_dir / f"initial.npz"
-    save_fem_structure(kite,save_path)
+    kite = load_fem_structure(kite_path / "hanging_test_initial.npz")
     return kite
 
 def loading(N,m_arr,tip_load,point_load):
